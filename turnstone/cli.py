@@ -1615,7 +1615,10 @@ def main() -> None:
         "--judge-model",
         dest="judge_model",
         default="",
-        help="Model for judge (default: same as session model)",
+        help=(
+            "Model for judge (default: same as session model); the output guard's "
+            "LLM stage runs on it too unless judge.output_guard_model is set"
+        ),
     )
     judge_group.add_argument(
         "--judge-timeout",

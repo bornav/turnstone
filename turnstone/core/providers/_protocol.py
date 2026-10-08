@@ -392,8 +392,9 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
 
 # The trailing-citations fold rule in one place: post-finish info
 # (web-search source footers) folds onto a non-blank answer only, joined
-# by this separator.  The interactive display consumer and the drain
-# share both pieces, so a footer cannot render two ways.
+# by this separator, after the caller's cleaner for text from outside has
+# run over it.  The interactive display consumer and the drain share all
+# three pieces, so a footer cannot render two ways.
 TRAILING_INFO_SEPARATOR = "\n\n"
 
 
@@ -403,7 +404,10 @@ def folds_trailing_info(content: str) -> bool:
 
 
 def drain_stream(
-    chunks: Iterator[StreamChunk], *, scan_inline_reasoning: bool = True
+    chunks: Iterator[StreamChunk],
+    *,
+    scan_inline_reasoning: bool = True,
+    clean_trailing_info: Callable[[str], str] | None = None,
 ) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
 
@@ -411,6 +415,10 @@ def drain_stream(
     — the backend puts reasoning in its own channel) skips the inline
     split: there is none to find, and the scan could only misroute prose
     that quotes a tag.
+
+    *clean_trailing_info* cleans each citations footer before it folds in
+    (the ``info_delta`` bullet below): its page titles and URLs are text from
+    outside, and the folded footer replays as part of the assistant turn.
 
     The ONE non-streaming transport: single-shot callers (``model_turn``)
     sample through the provider's streaming entry and accumulate here, so
@@ -575,6 +583,8 @@ def drain_stream(
     # the strip scan shouldn't tax every drained completion).
     if trailing_info_parts and folds_trailing_info(content):
         for info in trailing_info_parts:
+            if clean_trailing_info is not None:
+                info = clean_trailing_info(info)
             content += TRAILING_INFO_SEPARATOR + info
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]

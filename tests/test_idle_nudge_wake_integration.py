@@ -952,7 +952,9 @@ def test_wake_channel_survives_real_seam_drains_and_delivers_via_wake(tmp_db):
         assert len(session._nudge_queue) == 2
 
         # Real tool-seam drain (last result of a batch): same discipline.
-        specs = session._collect_advisories(None, "some_tool", True)
+        specs = session._collect_advisories(
+            None, "some_tool", received=None, result_index=1, result_count=1
+        )
         assert specs == []
         assert len(session._nudge_queue) == 2
 

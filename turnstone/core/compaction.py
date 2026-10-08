@@ -600,16 +600,6 @@ class CompactionEngine:
             batches.append(current)
         return batches
 
-    def summarize_messages(
-        self,
-        messages: Sequence[dict[str, Any]],
-        runtime: SummaryRuntime,
-    ) -> SummaryResult:
-        blocks = self.summary_blocks(messages)
-        if not blocks:
-            raise CompactionIrreducibleError
-        return self.summarize_blocks(blocks, runtime)
-
     def summarize_once(
         self,
         system_prompt: str,

@@ -225,6 +225,7 @@ from turnstone.core.nudge_queue import (
     Entry,
     NudgeQueue,
 )
+from turnstone.core.output_guard import ControllerText
 from turnstone.core.pdf import PDF_TEXT_CHAR_CAP
 from turnstone.core.personas import (
     PersonaSnapshot,
@@ -273,7 +274,7 @@ from turnstone.core.storage._utils import (
 from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.tool_advisory import (
     make_system_turn,
-    render_output_guard_text,
+    output_guard_advisory,
     render_user_interjection,
 )
 from turnstone.core.tool_search import ToolSearchManager
@@ -287,6 +288,7 @@ from turnstone.core.tools import (
     TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
+    salvage_tool_arguments,
 )
 from turnstone.core.trajectory import (
     PROVENANCE_META_KEY,
@@ -1084,6 +1086,8 @@ class _StreamTurnConsumer:
             self._flush_terminal_carries()
             if self._trailing_info and folds_trailing_info("".join(self._content_parts)):
                 for info in self._trailing_info:
+                    # Cleaned as the drain cleans the footer it folds in.
+                    info = self._session._clean_incoming_text(info)
                     self._flush_text(TRAILING_INFO_SEPARATOR + info, False)
             self._trailing_info = []
 
@@ -7087,9 +7091,39 @@ class ChatSession:
 
     def _tool_is_available(self, name: str) -> bool:
         """Whether a named function is both registered and persona-visible."""
-        return self._persona_tool_visible(name) and any(
-            tool.get("function", {}).get("name") == name for tool in self._tools
-        )
+        return self._persona_tool_visible(name) and self._tool_is_registered(name)
+
+    def _tool_is_registered(self, name: str) -> bool:
+        """Whether *name* is in this session's tool catalog (built-in or MCP)."""
+        return any(tool.get("function", {}).get("name") == name for tool in self._tools)
+
+    def _fence_tokens(self) -> tuple[str, str]:
+        """This session's fence tokens, which untrusted text on the wire must never carry."""
+        return (self._envelope_nonce, self._sender_label_nonce)
+
+    def _clean_incoming_text(self, text: str) -> str:
+        """*text* from outside, its trusted markers defanged and this session's tokens removed.
+
+        The wire passes leave assistant and system turns as written, so text from
+        outside that the framework composes into one is cleaned where it is
+        composed: what a compaction summary quotes verbatim (the last user
+        message, the handles block), a hosted search's citations footer, a queued
+        message's interjection turn.  The summarizer reads every block through it
+        too (:meth:`_summary_blocks`), the model's own turns included.
+        """
+        return neutralize_untrusted_fences(text, tokens=self._fence_tokens())
+
+    def _summary_blocks(self, messages: list[dict[str, Any]]) -> list[str]:
+        """The compaction engine's blocks for *messages*, cleaned for the summarizer.
+
+        The summarizer reads only these and the engine's own prompt, so it
+        never reads a session token, and its summary, an assistant turn the
+        wire passes leave as written, is saved as it wrote it.
+        """
+        return [
+            self._clean_incoming_text(block)
+            for block in self._compaction_engine.summary_blocks(messages)
+        ]
 
     def _operator_prompt_addition(self, caps: ModelCapabilities) -> str:
         """Trust declaration required when operator turns use nonce fences."""
@@ -8041,7 +8075,7 @@ class ChatSession:
                         cancel_ref=cancel_ref,
                         principal_id=principal_id,
                     )
-                part = neutralize_attachment_part(raw_part)
+                part = neutralize_attachment_part(raw_part, tokens=self._fence_tokens())
                 if cancel_ref is not None and cancel_ref.aborted:
                     raise GenerationCancelled
                 if part is not None:
@@ -8088,6 +8122,7 @@ class ChatSession:
                 cancel_ref=cancel_ref,
                 principal_id=principal_id,
             ),
+            tokens=self._fence_tokens(),
             max_extracted_chars=max_pdf_extracted_chars,
             check_cancelled=check_pdf_cancelled if cancel_ref is not None else None,
         )
@@ -8234,16 +8269,15 @@ class ChatSession:
         )
         if not transcript:
             return None
-        # Transcribed speech is untrusted the same way typed message content is:
-        # defang look-alike sender-label markers so an uploaded audio clip
-        # can't forge attribution (the perception fallback follows the same
-        # attachment-derived-text boundary).
+        # Transcribed speech is untrusted the same way typed message content is.
+        # The resolver's attachment pass (``neutralize_attachment_part``) defangs
+        # trusted markers and removes the session's tokens from this part, as
+        # from every attachment part it returns.
         return {
             "type": "text",
             "text": (
                 f"[Transcript of audio attachment '{safe_attachment_label(name)}' "
-                f"(untrusted)]\n\n"
-                f"{neutralize_untrusted_fences(transcript)}"
+                f"(untrusted)]\n\n{transcript}"
             ),
         }
 
@@ -8411,14 +8445,13 @@ class ChatSession:
             return None
         name = str(att.get("filename") or kind)
         # The perception model's description is untrusted the same way typed
-        # message content is: defang look-alike sender-label markers so a
-        # perceived image/PDF/audio can't forge attribution.
+        # message content is; the resolver's attachment pass cleans it, as it
+        # does the transcript part above.
         return {
             "type": "text",
             "text": (
                 f"[Perception of {kind} attachment '{safe_attachment_label(name)}' "
-                f"(untrusted)]\n\n"
-                f"{neutralize_untrusted_fences(text)}"
+                f"(untrusted)]\n\n{text}"
             ),
         }
 
@@ -8602,13 +8635,18 @@ class ChatSession:
         out: list[dict[str, Any]] = []
         for m in messages:
             # Sender attribution is trusted only when this pass prepends it to
-            # a participant user turn.  Defang the same exact marker everywhere
-            # else first, including tool output and provider-native assistant
-            # plaintext, so a leaked session nonce cannot acquire authorship.
+            # a participant user turn.  Defang the same exact marker in all other
+            # text from outside first, tool output included, so a leaked session
+            # nonce cannot acquire authorship.  Assistant turns replay as
+            # returned; text from outside that the framework composes into one
+            # is cleaned there (_clean_incoming_text), a hosted search's native
+            # result and citation blocks excepted.
             safe_message = (
                 m
-                if m.get("role") == "system"
-                else neutralize_message_fence_markers(m, fence.SENDER_LABEL_TAG)
+                if m.get("role") in ("system", "assistant")
+                else neutralize_message_fence_markers(
+                    m, fence.SENDER_LABEL_TAG, token=self._sender_label_nonce
+                )
             )
             sender = (m.get("_sender") or "").strip() if m.get("role") == "user" else ""
             if sender:
@@ -8713,6 +8751,37 @@ class ChatSession:
         """
         structured = self._prepare_wire_structure(messages, caps=caps)
         return repair_wire_messages(structured)
+
+    def _prepare_task_agent_wire(
+        self,
+        messages: list[dict[str, Any]],
+        lane: ModelLane,
+    ) -> list[dict[str, Any]]:
+        """A task agent's ``prepare_wire``: fence declaration, then lowering.
+
+        The agent's system prompt is composed once from the primary lane's
+        posture, so it declares the operator fence only when the primary
+        folds.  The agent's own lane, or a fallback, can fold when the primary
+        does not, and its output-guard advisories would then arrive in a fence
+        its prompt never declared, reading like the injections they warn
+        about.  The main loop adds the missing declaration per serving lane
+        (``_system_messages_for_lane``); this is the task agent's equivalent,
+        limited to the fence declaration because the agent's tool set is
+        fixed and the tool-search hint does not apply.
+        """
+        caps = require_lane_capabilities(lane)
+        declaration = self._operator_prompt_addition(caps)
+        head = messages[0] if messages else None
+        if (
+            declaration
+            and head is not None
+            and head.get("role") == "system"
+            and not head.get("_source")
+            and isinstance(head.get("content"), str)
+            and declaration not in head["content"]
+        ):
+            messages = [{**head, "content": f"{head['content']}\n\n{declaration}"}, *messages[1:]]
+        return self._prepare_lowered_wire_messages(messages, caps=caps)
 
     def _emit_state(
         self,
@@ -9267,6 +9336,7 @@ class ChatSession:
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
         validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
         use_session_temperature: bool = True,
+        clean_trailing_info: Callable[[str], str] | None = None,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
@@ -9333,6 +9403,11 @@ class ChatSession:
 
         ``validate_wire`` is an optional final local size check after that
         materialization. It runs inside :func:`model_turn` before provider I/O.
+
+        ``clean_trailing_info`` reaches :func:`model_turn`: compaction passes
+        :meth:`_clean_incoming_text`, since its result is saved as an assistant
+        turn.  Extraction leaves it out: its answer becomes a tool result, which
+        the output guard reads as it came and the fold cleans on the wire.
         """
         lane = lane or self._primary_lane()
         effective_principal_id = (
@@ -9365,6 +9440,7 @@ class ChatSession:
             acting_principal_id=effective_principal_id,
             resolve_attachments=resolve_attachments,
             validate_wire=validate_wire,
+            clean_trailing_info=clean_trailing_info,
         )
 
     def _record_aux_usage(self, usage: UsageInfo | None, *, model: str | None = None) -> None:
@@ -9897,6 +9973,7 @@ class ChatSession:
                     cancel_ref=ref,
                     acting_principal_id=principal_id or "",
                     on_chunk=consumer,
+                    clean_trailing_info=self._clean_incoming_text,
                     product_recovery=True,
                 )
             except Exception as e:
@@ -13173,6 +13250,12 @@ class ChatSession:
                 # Bail if generation was superseded during tool execution.
                 if self._generation != my_generation:
                     return
+                # Results the framework wrote itself (a denial) pass the guard by
+                # (``ControllerText``).  The repeat warning and admission rebuild
+                # strings, which drops the mark, so note them as they arrive.
+                _controller_ids = {
+                    tc_id for tc_id, output in results if isinstance(output, ControllerText)
+                }
 
                 # Same construction as the duplicate-id gate above; one
                 # comprehension serves both so the two checks can never
@@ -13385,20 +13468,25 @@ class ChatSession:
                 # gain and the overhead isn't worth it.
                 _batch_guard: dict[str, tuple[str, OutputAssessment | None]] = {}
                 _judge_cfg = self._judge_cfg
+                _guarded_texts = [
+                    (tc_id, o)
+                    for tc_id, o in results
+                    if isinstance(o, str) and tc_id not in _controller_ids
+                ]
                 if (
                     _judge_cfg
                     and _judge_cfg.output_guard
                     and _judge_cfg.output_guard_llm
-                    and sum(1 for _, o in results if isinstance(o, str)) > 1
+                    and len(_guarded_texts) > 1
                 ):
                     _batch_guard = self._batch_evaluate_outputs(
                         [
                             (tc_id, o, _tc_names.get(tc_id, ""), _tc_args.get(tc_id, ""))
-                            for tc_id, o in results
-                            if isinstance(o, str)
+                            for tc_id, o in _guarded_texts
                         ],
                         my_generation=my_generation,
                     )
+                del _guarded_texts
                 # Output-guard inference is a blocking boundary.  A force
                 # successor may claim the session while the old judge is
                 # winding down with an ordinary fallback/error verdict; reject
@@ -13409,7 +13497,11 @@ class ChatSession:
                 for _ri, (tc_id, output) in enumerate(results):
                     # Output guard: evaluate tool result before it enters context
                     assessment: OutputAssessment | None = None
-                    if self._judge_cfg and self._judge_cfg.output_guard:
+                    if (
+                        self._judge_cfg
+                        and self._judge_cfg.output_guard
+                        and tc_id not in _controller_ids
+                    ):
                         if isinstance(output, str):
                             if tc_id in _batch_guard:
                                 output, assessment = _batch_guard[tc_id]
@@ -13422,23 +13514,13 @@ class ChatSession:
                                     my_generation=my_generation,
                                 )
                         elif isinstance(output, list):
-                            # Image/structured output — evaluate each text part
-                            # independently so credentials in any part get redacted.
-                            for p in output:
-                                if (
-                                    isinstance(p, dict)
-                                    and p.get("type") == "text"
-                                    and p.get("text")
-                                ):
-                                    p["text"], _part_assess = self._evaluate_output(
-                                        tc_id,
-                                        p["text"],
-                                        _tc_names.get(tc_id, ""),
-                                        tool_args=_tc_args.get(tc_id, ""),
-                                        my_generation=my_generation,
-                                    )
-                                    if _part_assess is not None:
-                                        assessment = _part_assess
+                            assessment = self._guard_list_result(
+                                tc_id,
+                                output,
+                                _tc_names.get(tc_id, ""),
+                                tool_args=_tc_args.get(tc_id, ""),
+                                my_generation=my_generation,
+                            )
 
                     # This is the result-fold commit fence.  Everything below
                     # mutates shared session/UI/storage state, so a generation
@@ -13457,7 +13539,9 @@ class ChatSession:
                 # whose text no longer locates the marker exactly once passes
                 # as the guard left it: what the guard produced is what the
                 # model sees, and the pre-send hard-compaction guard remains
-                # the backstop for a batch that grew past its allowance.
+                # the backstop for a batch that grew past its allowance.  The
+                # advisory then checks its citations against the re-cut text and
+                # says the result was cut (``output_guard_advisory``).
                 recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
                 for _ri, tc_id, output, assessment in guarded_results:
                     rendered = _admissions.get(tc_id)
@@ -13505,7 +13589,9 @@ class ChatSession:
                         result_advisories = self._collect_advisories(
                             assessment,
                             tc_names.get(tc_id, ""),
-                            _ri == last_idx,
+                            received=output,
+                            result_index=_ri + 1,
+                            result_count=last_idx + 1,
                         )
 
                         _tname = tc_names.get(tc_id, "")
@@ -13674,6 +13760,10 @@ class ChatSession:
                     allow_cancelled=False,
                 ):
                     raise GenerationCancelled()
+                # The committed results and their assessments, which hold the
+                # text the guard returned, must not outlive the fold into the
+                # next model request.
+                del fold_tool_batch, guarded_results, recut, _batch_guard
 
                 # Stop may land immediately after the result-fold transaction.
                 # Reject both cooperative Stop and force supersession before a
@@ -15595,6 +15685,10 @@ class ChatSession:
                 principal_id=resolved_principal,
                 reasoning_effort=reasoning_effort,
                 use_session_temperature=use_session_temperature,
+                # A summary is saved as an assistant turn as the summarizer
+                # wrote it; a citations footer folded into it is text from
+                # outside.
+                clean_trailing_info=self._clean_incoming_text,
             )
 
         progress: Callable[[dict[str, Any]], None]
@@ -15682,7 +15776,8 @@ class ChatSession:
 
         Sanitiser ruling, one oracle for the whole block — ``sanitize_display``:
 
-        * Model-authored text (titles, notes, child names) is sanitised.  The
+        * Free text (task titles and notes, from the coordinator's own task
+          calls; child names, which others can rename) is sanitised.  The
           control class is what this render actually needs: these are single-line
           list rows, and a newline inside a title would forge a sibling row the
           model then reads as a real task.  That class is identical in both
@@ -16195,7 +16290,12 @@ class ChatSession:
             split = len(to_summarize)  # preserved == self.messages[split:]
             real_users = self._find_turn_boundaries()
             if real_users and real_users[-1] < split:  # summarized, not preserved
-                last_user_content = self.messages[real_users[-1]].text or ""
+                # Quoted into the summary's assistant turn, which the wire
+                # passes leave as written: cleaned here, as the fold cleans it
+                # in its own turn.
+                last_user_content = self._clean_incoming_text(
+                    self.messages[real_users[-1]].text or ""
+                )
 
         # Build summary blocks from ALL of to_summarize (per-message), then
         # summarize via chunked/hierarchical compaction.  Sizing by the actual
@@ -16205,7 +16305,7 @@ class ChatSession:
         # selection — not a fitting prefix — also fixes the latent drop of the
         # most-recent (unselected) messages.
         to_summarize_dicts = dicts_from_turns(to_summarize)
-        blocks = self._compaction_engine.summary_blocks(to_summarize_dicts)
+        blocks = self._summary_blocks(to_summarize_dicts)
         if not blocks:
             return self._compaction_bailed(
                 "not_enough_messages",
@@ -16330,13 +16430,21 @@ class ChatSession:
             self._compaction_engine.carry_budget_chars(summary_runtime, carries) if carries else 0
         )
 
+        # The summarizer read cleaned blocks (_summary_blocks), so its summary
+        # stays as it wrote it, as does the wind-down spill, the model's own
+        # last turn.
         summary = summary_result.text
 
         # Handles first (state the harness knows exactly), then wind-down, then
         # how to resume — the summary reads: sections, the ids still in play,
         # what the model recorded, then the ask to continue from.
         if handles:
-            summary += self._render_handles_block(task_lines, child_lines, carry_budget)
+            # The whole block is cleaned: a child's name is anyone's rename,
+            # text from outside in the summary's assistant turn, which the
+            # wire passes leave as written.
+            summary += self._clean_incoming_text(
+                self._render_handles_block(task_lines, child_lines, carry_budget)
+            )
 
         carry_truncated = False
         if spill_text:
@@ -17389,10 +17497,11 @@ class ChatSession:
         """Run the output guard on tool result text.
 
         Two stages.  The heuristic regex stage always runs; the LLM judge
-        (issue #560 mitigation #1) runs when ``judge.output_guard_llm``
-        is enabled.  When both run and the LLM succeeds, the LLM verdict
-        is the *acted* assessment (informs redaction + UI + return);
-        otherwise the heuristic stands.  Both tier rows are persisted
+        (issue #560 mitigation #1) runs when ``judge.output_guard_llm`` is
+        enabled.  The operator's chip merges both verdicts; the model reads
+        a separate projection built only from controller-authored content
+        (:func:`~turnstone.core.output_guard.project_model_finding`).
+        Redaction is the heuristic's alone.  Both tier rows are persisted
         whenever the LLM ran, for audit completeness.
 
         ``tool_args`` is the JSON-string args the tool was called with
@@ -17407,7 +17516,8 @@ class ChatSession:
         row, warning, or sanitized result for a successor generation.
 
         Returns ``(possibly_sanitized_output, acted_assessment)``.  The
-        acted assessment is ``None`` when its risk_level is ``"none"``.
+        acted assessment is the model-facing projection, ``None`` when there
+        is nothing to show (merged risk ``"none"`` and nothing redacted).
         """
 
         def _check_owner() -> None:
@@ -17422,6 +17532,8 @@ class ChatSession:
             OutputAssessment,
             evaluate_output,
             merge_guard_display_payload,
+            project_model_finding,
+            surviving_line_ranges,
         )
 
         judge_principal = principal_id
@@ -17447,6 +17559,17 @@ class ChatSession:
             trusted_sender_label_nonce=self._sender_label_nonce,
         )
         _check_owner()
+        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
+        if not wants_redaction:
+            # ``sanitized`` means "redaction was applied" to every consumer
+            # below (the judge, audit rows, the acted assessment, the returned
+            # text), so a redacted copy the configuration declines is dropped
+            # here, at the one producer, rather than gated at each consumer.
+            heuristic = dataclasses.replace(heuristic, sanitized=None)
+        # The judge reads what the model will: the redacted text when redaction
+        # applies, so a secret the model never sees does not reach the guard's
+        # model, possibly another provider's, nor its reasoning in the audit row.
+        judged = heuristic.sanitized if heuristic.sanitized is not None else output
 
         # Stage 2: LLM judge (opt-in, capability-gated).  The rate limiter
         # bounds adversarial fan-out cost (60 calls/min/session).  The
@@ -17475,7 +17598,7 @@ class ChatSession:
         llm_verdict = (
             self._invoke_output_guard_judge(
                 call_id,
-                output,
+                judged,
                 func_name,
                 tool_description=tool_description,
                 tool_args=tool_args,
@@ -17493,25 +17616,20 @@ class ChatSession:
 
         output_len = len(output)
 
-        # Merge the two detectors into one acted finding (issue #560,
-        # "show, annotated").  Risk = max(heuristic, llm); flags = union.
-        # An LLM "none" — or a failed/absent LLM — never LOWERS a heuristic
-        # positive: the judge evaluates adversarial tool output, so it may
-        # escalate but must not be able to hide a deterministic regex
-        # finding.  Credential redaction stays a heuristic-only signal the
-        # LLM cannot override (bug-1 / sec-1): a secret is redacted whether
-        # or not the judge sees injection.
+        # The two detectors merge for the operator's chip (issue #560, "show,
+        # annotated"): risk = max(heuristic, llm), flags = union.  An LLM "none"
+        # — or a failed/absent LLM — never LOWERS a heuristic positive: the judge
+        # evaluates adversarial tool output, so it may escalate but must not be
+        # able to hide a deterministic regex finding.  The model reads a
+        # projection of the same finding at the merged risk, built from
+        # framework-written text only (``project_model_finding`` below).
+        # Credential redaction stays a heuristic-only signal the LLM cannot
+        # override (bug-1 / sec-1): a secret is redacted whether or not the
+        # judge sees injection.
         # ``llm`` is the narrowed, succeeded-only verdict (None on
         # disable / rate-limit / error / timeout) — lets the type checker
         # follow attribute access below without re-asserting succeeded.
         llm = llm_verdict if (llm_verdict is not None and llm_verdict.succeeded) else None
-        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
-        if not wants_redaction:
-            # ``sanitized`` means "redaction was applied" to every consumer
-            # below (audit rows, the acted assessment, the returned text), so
-            # a redacted copy the configuration declines is dropped here, at
-            # the one producer, rather than gated at each consumer.
-            heuristic = dataclasses.replace(heuristic, sanitized=None)
 
         # Persistence — one row per (call_id, tier).  Heuristic row when it
         # has signal; the LLM row carries the judge's OWN verdict on success
@@ -17621,24 +17739,30 @@ class ChatSession:
         if d is None:
             return output, None
 
-        # Context-facing annotations (what the MODEL sees via the
-        # output_guard operator-context system turn):
-        # the heuristic findings, plus the LLM's reasoning ONLY when the LLM
-        # ESCALATED (flagged something itself).  We deliberately never inject
-        # the judge's "benign" reasoning into the model context — a judge
-        # fooled into "none" on a real heuristic finding must not get to tell
-        # the model the output is safe.  The operator UI still shows the full
-        # LLM verdict via the chip payload below.
-        context_annotations = list(heuristic.annotations)
-        if llm is not None and llm.risk_level != "none" and llm.reasoning:
-            context_annotations.append(llm.reasoning)
-        # acted's risk/flags come straight from the merge payload so the
-        # context advisory can't drift from the chip.
-        acted = OutputAssessment(
-            flags=list(d["flags"]),
-            risk_level=str(d["risk_level"]),
-            annotations=context_annotations,
-            sanitized=heuristic.sanitized,
+        # What the MODEL reads (the output_guard operator-context system
+        # turn) is selected, never generated: the judge wrote its reasoning
+        # and flags after reading attacker-controlled output, and the advisory
+        # carries operator-level trust.  So the model gets the heuristic's
+        # findings as they are plus the judge's flags mapped onto fixed
+        # symbols, and the lines it cited in the text it read, which is the
+        # text the model receives; the chip payload above keeps the judge's own
+        # words for the operator.  Risk is the merged level, so the advisory and
+        # the chip agree on it, and a judge fooled into "none" lowers nothing.
+        acted = dataclasses.replace(
+            project_model_finding(
+                risk_level=str(d["risk_level"]),
+                heuristic_flags=heuristic.flags,
+                heuristic_annotations=heuristic.annotations,
+                sanitized=heuristic.sanitized,
+                judge_risk=llm.risk_level if llm else "none",
+                judge_flags=llm.flags if llm else (),
+                # One text on both sides: this only bounds, merges and caps
+                # the ranges the judge cited.
+                cited_lines=(
+                    surviving_line_ranges(llm.lines, judged, judged) if llm is not None else ()
+                ),
+            ),
+            returned_text=judged,
         )
 
         d["func_name"] = func_name
@@ -17667,11 +17791,48 @@ class ChatSession:
         ):
             raise GenerationCancelled()
 
-        if wants_redaction:
-            sanitized = heuristic.sanitized
-            if sanitized is not None:
-                return sanitized, acted
-        return output, acted
+        return judged, acted
+
+    def _guard_list_result(
+        self,
+        call_id: str,
+        parts: list[Any],
+        func_name: str,
+        *,
+        tool_args: str,
+        my_generation: int = 0,
+        principal_id: str | None = None,
+        cancel_ref: StreamAbortRef | None = None,
+    ) -> OutputAssessment | None:
+        """Guard each text part of a list result in place; return the result's finding.
+
+        A list result carries text beside images.  Each text part a tool wrote
+        is guarded on its own, so a credential in any of them is redacted, and
+        the last flagged part's finding stands for the result.  Framework-written
+        parts (:class:`ControllerText`), such as the header ``read_file`` puts
+        before an image, pass by.  Both loops call this; the loop's names end
+        with the call, so no image part stays reachable after the step.
+        """
+        assessment: OutputAssessment | None = None
+        for part in parts:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and part.get("text")
+                and not isinstance(part["text"], ControllerText)
+            ):
+                part["text"], part_assessment = self._evaluate_output(
+                    call_id,
+                    part["text"],
+                    func_name,
+                    tool_args=tool_args,
+                    my_generation=my_generation,
+                    principal_id=principal_id,
+                    cancel_ref=cancel_ref,
+                )
+                if part_assessment is not None:
+                    assessment = part_assessment
+        return assessment
 
     def _batch_evaluate_outputs(
         self,
@@ -18442,7 +18603,10 @@ class ChatSession:
         self,
         assessment: OutputAssessment | None,
         func_name: str,
-        is_last_in_batch: bool,
+        *,
+        received: str | list[Any] | None,
+        result_index: int,
+        result_count: int,
     ) -> list[tuple[str, str, dict[str, Any]]]:
         """Gather operator context for a tool result as system-turn specs.
 
@@ -18451,9 +18615,13 @@ class ChatSession:
         ``{"role": "system"}`` turn AFTER the tool message (the caller
         feeds each through :meth:`_append_system_turn`):
 
-        - **Output guard** findings (``source="output_guard"``) — rendered
-          inline here (flags + risk level + annotations + the
-          redaction notice).  Attach per-result.
+        - **Output guard** findings (``source="output_guard"``) — built by
+          :func:`~turnstone.core.tool_advisory.output_guard_advisory` (flags +
+          risk level + annotations + the redaction notice).  Attach
+          per-result, naming the result by its position in the batch
+          (*result_index* of *result_count*, from 1) and its tool when the
+          batch returned several, and checked against *received*, the result
+          as the model receives it.
         - **Queued user messages** (Seam 1, ``source="user_interjection"``)
           — drained on the LAST result of a batch.  ``meta`` carries the
           ``priority`` so the UI can frame important interjections
@@ -18470,20 +18638,22 @@ class ChatSession:
         on the last result only — no duplication across N tool results.
         """
         specs: list[tuple[str, str, dict[str, Any]]] = []
+        is_last_in_batch = result_index == result_count
 
-        # Output guard advisory.  The structured finding is the source of
-        # truth: build ``meta`` (flags / risk / annotations / redaction), then
-        # derive the wire/UI text ``content`` from it via
-        # ``render_output_guard_text`` so the prose the model reads and the FE
-        # guard-finding card cannot drift.  Mirrors the legacy GuardAdvisory.
+        # Output guard advisory, built by the helper the task-agent loop shares
+        # (structured ``meta`` first, text derived from it, so the prose the
+        # model reads and the FE guard-finding card cannot drift).
         if assessment is not None:
-            guard_meta: dict[str, Any] = {
-                "flags": list(assessment.flags),
-                "risk_level": assessment.risk_level,
-                "annotations": list(assessment.annotations),
-                "redacted": assessment.sanitized is not None,
-            }
-            specs.append(("output_guard", render_output_guard_text(guard_meta), guard_meta))
+            guard_content, guard_meta = output_guard_advisory(
+                assessment,
+                received=received,
+                index=result_index,
+                count=result_count,
+                # The model chose the name; only one this session offers is
+                # framework-known enough to print in an operator-trust turn.
+                tool=func_name if self._tool_is_registered(func_name) else "",
+            )
+            specs.append(("output_guard", guard_content, guard_meta))
 
         # Last-result-in-batch drain seams: queued user messages (Seam 1)
         # and tool/any-channel metacog nudges.  Both fire once per batch so a
@@ -18518,7 +18688,10 @@ class ChatSession:
                     # "queued message" bubble (the operator reads the
                     # message, not the model-directed preamble) with priority
                     # emphasis.  Both derive from ``(text, priority)``.
-                    framed = render_user_interjection(text, priority)
+                    # The participant's words are text from outside in a
+                    # system turn, which the wire passes leave as written:
+                    # cleaned here, while the card shows them as written.
+                    framed = render_user_interjection(self._clean_incoming_text(text), priority)
                     interjection_meta = {"priority": priority, "message": text}
                     sender = _queued_row_owner(row)
                     if sender:
@@ -18897,15 +19070,15 @@ class ChatSession:
                 )
                 return item["call_id"], item["error"]
             if item.get("denied"):
-                msg = item.get("denial_msg", "Denied by user")
+                denial = ControllerText(item.get("denial_msg", "Denied by user"))
                 self._report_tool_result(
                     item["call_id"],
                     item.get("func_name", "unknown"),
-                    msg,
+                    denial,
                     is_error=True,
                     status=EffectStatus.NONE,
                 )
-                return item["call_id"], msg
+                return item["call_id"], denial
             try:
                 # Mark the final executor-admission boundary atomically with a
                 # last owner/cancel check.  A queued parallel sibling remains
@@ -19129,48 +19302,7 @@ class ChatSession:
         try:
             args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
-            args = None
-            # Fallback 1: regex-extract a known key from malformed JSON.
-            # Keep this list focused on primary/identifying keys — the
-            # model will see the salvaged minimal-args result and
-            # resubmit with correct JSON on the next turn.  Coordinator
-            # keys (ws_id, message, initial_message, parent_ws_id) are
-            # included so malformed coordinator tool calls aren't a
-            # dead-end.
-            for key in (
-                "action",
-                "command",
-                "code",
-                "content",
-                "initial_message",
-                "message",
-                "name",
-                "page",
-                "parent_ws_id",
-                "path",
-                "pattern",
-                "prompt",
-                "query",
-                "status",
-                "task_id",
-                "title",
-                "uri",
-                "url",
-                "ws_id",
-            ):
-                m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
-                if m:
-                    try:
-                        val = json.loads('"' + m.group(1) + '"')
-                    except (json.JSONDecodeError, Exception):
-                        val = m.group(1)
-                    args = {key: val}
-                    break
-            # Fallback 2: bare string (no JSON wrapper at all)
-            if args is None and raw_args.strip() and not raw_args.strip().startswith("{"):
-                pk = PRIMARY_KEY_MAP.get(func_name)
-                if pk:
-                    args = {pk: raw_args}
+            args = salvage_tool_arguments(func_name, raw_args)
             if args is None:
                 preview = raw_args[:4000] + ("..." if len(raw_args) > 4000 else "")
                 # Surface to user so they can see what the model produced
@@ -19283,7 +19415,7 @@ class ChatSession:
                 "header": f"\u2717 {func_name}: not available",
                 "preview": "",
                 "needs_approval": False,
-                "error": self._unavailable_tool_error(func_name),
+                "error": ControllerText(self._unavailable_tool_error(func_name)),
             }
         assert args is not None  # guaranteed by the early return on args is None above
         return preparer(call_id, args)
@@ -25262,7 +25394,7 @@ class ChatSession:
 
         self._current_read_files.add(resolved)
         content_parts: list[dict[str, Any]] = [
-            {"type": "text", "text": f"Image file: {path} ({len(raw):,} bytes)"},
+            {"type": "text", "text": ControllerText(f"Image file: {path} ({len(raw):,} bytes)")},
             {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},
         ]
 
@@ -25824,10 +25956,8 @@ class ChatSession:
                     wire_id_map=wire_id_map,
                     cancel_ref=cancel_scope.cancel_ref,
                     acting_principal_id=agent_principal,
-                    prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
-                        wire,
-                        caps=require_lane_capabilities(serving_lane),
-                    ),
+                    prepare_wire=self._prepare_task_agent_wire,
+                    clean_trailing_info=self._clean_incoming_text,
                 )
             except Exception:
                 cancel_scope.check()
@@ -25998,9 +26128,7 @@ class ChatSession:
             # summarize only the replaceable suffix. Including the task prompt
             # in both places wastes the reclaimed budget and lets a paraphrase
             # compete with the authoritative delegation contract.
-            blocks = self._compaction_engine.summary_blocks(
-                dicts_from_turns(context_turns[len(agent_prefix) :])
-            )
+            blocks = self._summary_blocks(dicts_from_turns(context_turns[len(agent_prefix) :]))
             if not blocks:
                 failed_compaction_signature = signature
                 return False
@@ -26288,11 +26416,14 @@ class ChatSession:
             _maybe_compact_agent_context()
             result = _api_call_with_compaction()
 
-            # Handle truncation or content filter — stop agent early
+            # Handle truncation or content filter — stop agent early.  The turn
+            # still joins the trajectory, as every assistant turn does.
             if result.finish_reason == "length":
+                agent_turns.append(result.turn)
                 self.ui.on_info(f"[{label}] response truncated, stopping early")
                 return _finish_synthesis(_non_blank_or(result.content, "(truncated)"))
             if result.finish_reason == "content_filter":
+                agent_turns.append(result.turn)
                 self.ui.on_info(f"[{label}] blocked by content filter")
                 cancel_scope.check()
                 return "(content filter)"
@@ -26329,7 +26460,12 @@ class ChatSession:
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
             tool_names = frozenset(t["function"]["name"] for t in tools)
-            for tc_dict in result.tool_calls:
+            # Output-guard advisories wait for the step's complete tool block:
+            # the results of one assistant turn's calls must stay contiguous on
+            # every wire, as in the main loop's fold.
+            guard_turns: list[Turn] = []
+            call_count = len(result.tool_calls)
+            for call_number, tc_dict in enumerate(result.tool_calls, start=1):
                 cancel_scope.check()
                 tool_name = tc_dict["function"]["name"].strip()
                 # Register every issued sub-tool under its parent task_agent —
@@ -26350,12 +26486,12 @@ class ChatSession:
                 output: Any
                 # Guard 1: block recursive agent calls.
                 if tool_name == "task_agent":
-                    output = "Error: agents cannot spawn further agents"
+                    output = ControllerText("Error: agents cannot spawn further agents")
                     is_tool_error = True
                     child_effect_status = EffectStatus.NONE
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
-                    output = (
+                    output = ControllerText(
                         f"Error: tool '{tool_name}' is not available in "
                         f"agent mode. "
                         f"Available: {', '.join(sorted(tool_names))}"
@@ -26455,7 +26591,7 @@ class ChatSession:
                             # the CLI gate records a policy block in ``error``
                             # (and returns approved=True) — honour whichever the
                             # gate set before the flat default.
-                            output = (
+                            output = ControllerText(
                                 prepared.get("denial_msg")
                                 or prepared.get("error")
                                 or "Denied by user"
@@ -26465,7 +26601,7 @@ class ChatSession:
                             _, output = _execute_agent_tool(prepared, tool_name)
                             is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     else:
-                        output = f"Unknown tool: {tool_name}"
+                        output = ControllerText(f"Unknown tool: {tool_name}")
                         is_tool_error = True
                         child_effect_status = EffectStatus.NONE
 
@@ -26513,12 +26649,12 @@ class ChatSession:
                     if isinstance(output, ProjectedText) or len(output) > _AGENT_GUARD_WINDOW_CHARS:
                         # A capture arrives as a rendering with its source
                         # attached: render the window from that source here,
-                        # in the head mode the clip below uses, so the guard
-                        # scans exactly the text the agent will receive and
-                        # nothing the clip could reveal afterwards.  The
-                        # window carries the marker from the start: should
-                        # redaction shrink it below the clip, the result still
-                        # reads as cut, with its true size.
+                        # in the head mode the clip below uses, so the agent
+                        # receives the start of what the guard scanned and
+                        # nothing the guard did not.  The window carries the
+                        # marker from the start: should redaction shrink it
+                        # below the clip, the result still reads as cut, with
+                        # its true size.
                         output = _clip_agent_text(
                             output,
                             _AGENT_GUARD_WINDOW_CHARS,
@@ -26526,18 +26662,36 @@ class ChatSession:
                             tool_name=tool_name,
                         )
 
-                # Output guard on the window.  Agent outputs are always str.
+                # Output guard on the window.  A tool's own text inside a list
+                # result is guarded part by part, as in the main loop.
                 cancel_scope.check()
-                if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
-                    output, _ = self._evaluate_output(
-                        tc_dict["id"],
-                        output,
-                        tool_name,
-                        tool_args=tc_dict.get("function", {}).get("arguments", ""),
-                        my_generation=origin_generation,
-                        principal_id=agent_principal,
-                        cancel_ref=cancel_scope.cancel_ref,
-                    )
+                assessment: OutputAssessment | None = None
+                if (
+                    self._judge_cfg
+                    and self._judge_cfg.output_guard
+                    and not isinstance(output, ControllerText)
+                ):
+                    guard_args = tc_dict.get("function", {}).get("arguments", "")
+                    if isinstance(output, str):
+                        output, assessment = self._evaluate_output(
+                            tc_dict["id"],
+                            output,
+                            tool_name,
+                            tool_args=guard_args,
+                            my_generation=origin_generation,
+                            principal_id=agent_principal,
+                            cancel_ref=cancel_scope.cancel_ref,
+                        )
+                    elif isinstance(output, list):
+                        assessment = self._guard_list_result(
+                            tc_dict["id"],
+                            output,
+                            tool_name,
+                            tool_args=guard_args,
+                            my_generation=origin_generation,
+                            principal_id=agent_principal,
+                            cancel_ref=cancel_scope.cancel_ref,
+                        )
                 if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
                     output = _clip_agent_text(
                         output,
@@ -26545,6 +26699,19 @@ class ChatSession:
                         original_chars=original_chars,
                         tool_name=tool_name,
                     )
+                if assessment is not None:
+                    # The guard read past the clip, so a finding on a cut
+                    # result may concern text the agent never receives; the
+                    # advisory, checked against what the agent receives, says
+                    # so and keeps only the citations the clip left in place.
+                    guard_content, _guard_meta = output_guard_advisory(
+                        assessment,
+                        received=output,
+                        index=call_number,
+                        count=call_count,
+                        tool=tool_name,
+                    )
+                    guard_turns.append(Turn.system(guard_content, source="output_guard"))
 
                 # NOTE: for a vision tool result ``output`` is a list[dict] of
                 # inline content parts (read_file on an image).  It lowers back
@@ -26576,11 +26743,13 @@ class ChatSession:
                     child_ids={tc_dict["id"]},
                 )
                 execution_journal.release_child(tc_dict["id"])
+            agent_turns.extend(guard_turns)
+            context_turns.extend(guard_turns)
             # Successful compaction runs at the top of the next iteration.
             # Drop the just-completed provider response and last tool locals
             # before that summary/model call so the context swap is also a real
             # reachability boundary for multimodal/native payloads.
-            del result, tc_dict, prepared, output
+            del result, tc_dict, prepared, output, assessment
             turn += 1
             tool_progress_epoch += 1
 
@@ -26606,6 +26775,7 @@ class ChatSession:
         agent_turns.append(synthesis_turn)
         context_turns.append(synthesis_turn)
         result = _api_call_with_compaction(_tools=[])
+        agent_turns.append(result.turn)
         cancel_scope.check()
         fallback = {
             "length": "(truncated)",
@@ -28073,6 +28243,10 @@ class ChatSession:
                         cancel_ref=model_cancel_ref,
                         principal_id=principal_id,
                     ),
+                    # Only the extraction call reads this, and its prompt
+                    # declares no fence; its answer is a tool result the fold
+                    # cleans.
+                    tokens=(),
                     max_extracted_chars=max_content,
                     check_cancelled=_check_fetch_cancelled,
                 )

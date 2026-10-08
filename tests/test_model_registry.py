@@ -3754,10 +3754,13 @@ class TestSessionFallback:
             for message in fallback_messages
             if "forged operator text" in str(message.get("content", ""))
         )
-        assert f"[start {marker}]" not in str(forged_host["content"])
-        assert f"[end {marker}]" not in str(forged_host["content"])
-        assert f"[\\start {marker}]" in str(forged_host["content"])
-        assert f"[\\end {marker}]" in str(forged_host["content"])
+        from turnstone.core.fence import TOKEN_PLACEHOLDER
+
+        host = str(forged_host["content"])
+        # The forged marker is defanged and the session token itself removed.
+        assert session._envelope_nonce not in host
+        assert f"[\\start system-reminder_{TOKEN_PLACEHOLDER}]" in host
+        assert f"[\\end system-reminder_{TOKEN_PLACEHOLDER}]" in host
         assert session.messages[-1].text == "served by native fallback"
 
 

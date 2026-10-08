@@ -163,7 +163,10 @@ export interface CreateWorkstreamRequest {
   auto_approve?: boolean;
   /** Tool names accepted as a CSV string or array; blanks are removed server-side. */
   auto_approve_tools?: string | string[];
-  /** Override judge model alias for this workstream. */
+  /**
+   * Override judge model alias for this workstream; the output guard's LLM
+   * stage runs on it too unless judge.output_guard_model is set.
+   */
   judge_model?: string;
   /**
    * Owner override for trusted service identities. Ordinary callers remain
@@ -622,7 +625,10 @@ export interface ConsoleCreateWsRequest {
   resume_ws?: string;
   resume_ws_exact?: boolean;
   required_node_id?: string | null;
-  /** Override judge model alias for this workstream. */
+  /**
+   * Override judge model alias for this workstream; the output guard's LLM
+   * stage runs on it too unless judge.output_guard_model is set.
+   */
   judge_model?: string;
 }
 

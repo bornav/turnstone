@@ -752,6 +752,42 @@ def test_builders_emit_conv_vocabulary() -> None:
         assert stale not in body, f"builders leaked stale vocab: {stale}"
 
 
+@node_skip
+def test_warning_names_one_of_several_results() -> None:
+    """An output-guard card names its result as the model's advisory does
+    (``result 2 of 3, web_fetch``): rendered from the advisory's own meta, the
+    chip's text holds the label the advisory text gives, as plain text."""
+    from turnstone.core.output_guard import OutputAssessment
+    from turnstone.core.tool_advisory import output_guard_advisory
+
+    assessment = OutputAssessment(flags=["pii"], risk_level="low")
+    text, meta = output_guard_advisory(assessment, index=2, count=3, tool="web_fetch")
+    assert "result 2 of 3, web_fetch" in text
+    script = (
+        FAKE_DOM
+        + f"""
+document.createTextNode = text => Object.assign(new FakeElement('text'), {{textContent: text}});
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const chip = conv.buildConvWarning({json.dumps(meta)});
+const read = el => el.textContent + el.children.map(read).join("");
+const shown = read(chip);
+if (!shown.includes("result 2 of 3, web_fetch")) throw new Error("label missing: " + shown);
+if (!shown.includes("LOW")) throw new Error("risk missing: " + shown);
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    body = _body()
+    start = body.index("export function buildConvWarning(")
+    builder = body[start : body.index("\nexport function ", start + 1)]
+    assert "innerHTML" not in builder
+
+
 def test_approve_all_label_unified() -> None:
     """Button language (BRIEFING): the persistent action reads 'Approve all'
     (a dashed --ok ghost), NOT the coordinator's old 'Always'.  The trio is

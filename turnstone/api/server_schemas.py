@@ -230,7 +230,8 @@ class CreateWorkstreamRequest(BaseModel):
         default="",
         description=(
             "Optional judge model alias for this workstream. Empty uses the "
-            "server's configured judge model."
+            "server's configured judge model. The output guard's LLM stage "
+            "runs on it too unless judge.output_guard_model is set."
         ),
     )
     auto_approve: bool = Field(default=False, description="Auto-approve all tool calls")

@@ -1169,12 +1169,12 @@ def _assistant_items_for_input(
 ) -> list[dict[str, Any]]:
     """Recover native message phases/order only while canonical history agrees.
 
-    A Turn joins all output messages into one text field. Native blocks retain
-    their boundaries, but may predate edits, fence neutralization, or call repair.
-    Match the text and call IDs before using that layout (a turn without text needs
-    only its call IDs to match), and always construct calls from the lowered
-    canonical fields. An ambiguous layout falls back to canonical text/calls with no
-    guessed phase, plus the existing reasoning replay.
+    A Turn joins all output messages into one text field. Native blocks retain their
+    boundaries, but may predate edits, a citations footer's cleaning, or call
+    repair. Match the text and call IDs before using that layout (a turn without
+    text needs only its call IDs to match), and always construct calls from the
+    lowered canonical fields. An ambiguous layout falls back to canonical text/calls
+    with no guessed phase, plus the existing reasoning replay.
 
     Hosted tool items of *hosted_tools* replay alongside the reasoning: in native
     order, and ahead of the text and calls when the layout falls back. With tool

@@ -682,6 +682,10 @@ class TestCompactBeforeTruncate:
             ),
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_maybe_compact_midturn") as midturn,
+            # Room for the tool result whatever the base prompt's size (the
+            # file tools' descriptions name the checkout path), so the
+            # zero-budget backstop stays out of this test.
+            patch.object(session, "_remaining_token_budget", return_value=1_000),
             patch("turnstone.core.session.save_message"),
         ):
             session.send("go")

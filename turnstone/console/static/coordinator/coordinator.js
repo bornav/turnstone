@@ -1175,7 +1175,8 @@ function createCoordinatorPane(root, wsId, opts) {
 
   // Structured ``.msg.guard-finding`` card for an ``output_guard``
   // operator-context system turn.  ``meta`` carries ``{flags, risk_level,
-  // annotations, redacted}``.  Reuses the tool-row warning chip's risk / flags
+  // annotations, redacted}``, and ``result`` when it is about one of a step's
+  // several results.  Reuses the tool-row warning chip's risk / flags / result
   // / redaction vocabulary (``.conv-warning``) so guard findings read
   // identically wherever they surface, then appends the annotations the inline
   // tool chip omits.  All text via textContent.  Mirrors the interactive pane's

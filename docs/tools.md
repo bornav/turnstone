@@ -137,7 +137,15 @@ After `_execute_tools()` returns, the main `send()` loop compacts/truncates
 completed results to the remaining shared budget and then runs the heuristic
 and optional LLM output guard. The task-agent loop deliberately guards the
 observed raw output before applying its size cap, so truncation cannot hide a
-sensitive result from that check.
+sensitive result from that check. Both loops guard each text part a tool wrote
+into a list result; the only list result today, `read_file` on an image, holds
+just the framework's header, which is not guarded. Both follow a flagged
+result with the same `output_guard` advisory, appended after the step's
+complete tool-result block. The advisory is checked against the result as the
+model receives it: a result cut after the guard read it (the task agent's cap,
+which the guard reads past, or the main loop's re-cut of a result redaction
+made longer than its share) says the finding may concern the part that was
+cut, and keeps only the cited lines the cut left in place.
 
 After guard work, the owning loop rechecks generation ownership. On the main
 conversation path, one generation-fenced commit appends the complete
