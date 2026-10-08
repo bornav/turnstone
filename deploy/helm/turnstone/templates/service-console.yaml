@@ -14,6 +14,12 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.console.service.type }}
+  {{- with .Values.console.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.console.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
   ports:
     - port: {{ .Values.console.service.port }}
       targetPort: http
