@@ -281,8 +281,12 @@ Determine the secret name for auth tokens.
 
 {{/*
 Container image reference.
+
 */}}
 {{- define "turnstone.image" -}}
-{{- $tag := .Values.image.tag | default .Chart.AppVersion }}
+{{- $tag := .Values.image.tag | default "" -}}
+{{- if not $tag }}
+{{- $tag = .Chart.AppVersion | default "latest" }}
+{{- end }}
 {{- printf "%s:%s" .Values.image.repository $tag }}
 {{- end }}
