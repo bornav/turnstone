@@ -46,7 +46,6 @@ server:
     annotations: {}
     labels: {}
     externalTrafficPolicy: ""
-    loadBalancerIP: ""
   # -- Node scheduling constraints
   nodeSelector: {}
   affinity: {}
@@ -68,7 +67,6 @@ console:
     annotations: {}
     labels: {}
     externalTrafficPolicy: ""
-    loadBalancerIP: ""
   # -- Node scheduling constraints
   nodeSelector: {}
   affinity: {}
